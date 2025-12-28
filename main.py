@@ -20,13 +20,21 @@ class Config:
     n_layers: int = 1  # single layer transformer
     d_mlp: int = 512
     dropout: float = 0.0
-    max_seq_len: int = 3  # a, b, = (we predict c after =)
-    vocab_size: int = 114  # 0-112 for numbers, 113 for '='
+    max_seq_len: int = 4  # a, op, b, = (we predict c after =)
+    op_pos: int = 1  # operator position: 0=prefix (op a b =), 1=infix (a op b =), 2=postfix (a b op =)
+    operators: tuple[str, ...] = ("+", "*")  # list of operators to include
+
+    @property
+    def vocab_size(self) -> int:
+        # p for numbers, 3 for '=' '+', and '*'
+        return self.p + 3
+
     train_frac: float = 0.3  # 30% train, 70% test
     lr: float = 1e-3
     weight_decay: float = 1.0
+    betas: tuple[float, float] = (0.9, 0.98)
     grad_clip: float = 1.0
-    epochs: int = 50000
+    epochs: int = 500_000
     log_every: int = 100
     seed: int = 42
     dtype: t.dtype = t.float32
@@ -48,40 +56,63 @@ def set_seed(seed: int):
 
 config = Config()
 EQUALS_TOKEN = config.p  # 113
+PLUS_TOKEN = config.p + 1  # 114
+MULT_TOKEN = config.p + 2  # 115
 
 
 # %%
-# Dataset: (a + b) mod p
-class ModAdditionDataset(Dataset):
-    def __init__(self, p: int, indices: list[tuple[int, int]]):
+# Dataset: (a + b) mod p and (a * b) mod p
+class ModArithmeticDataset(Dataset):
+    def __init__(self, p: int, data: list[tuple[int, int, str]]):
         self.p = p
-        self.data = indices  # list of (a, b) tuples
+        self.data = data  # list of (a, b, op) tuples where op is '+' or '*'
 
     def __len__(self):
         return len(self.data)
 
     def __getitem__(self, idx):
-        a, b = self.data[idx]
-        c = (a + b) % self.p
-        # Input: [a, b, =], Target: c
-        x = t.tensor([a, b, EQUALS_TOKEN], dtype=t.long)
-        y = t.tensor(c, dtype=t.long)
-        return x, y
+        a, b, op = self.data[idx]
+        if op == "+":
+            c = (a + b) % self.p
+            op_token = PLUS_TOKEN
+        else:  # op == '*'
+            c = (a * b) % self.p
+            op_token = MULT_TOKEN
+
+        # Build sequence based on operator position
+        if config.op_pos == 0:  # prefix: op a b =
+            seq = [op_token, a, b, EQUALS_TOKEN]
+        elif config.op_pos == 1:  # infix: a op b =
+            seq = [a, op_token, b, EQUALS_TOKEN]
+        else:  # postfix: a b op =
+            seq = [a, b, op_token, EQUALS_TOKEN]
+
+        seq_tensor = t.tensor(seq, dtype=t.long)
+        out_tensor = t.tensor(c, dtype=t.long)
+        return seq_tensor, out_tensor
 
 
 def create_datasets(p: int, train_frac: float):
-    """Create train/test datasets with train_frac of all pairs for training."""
-    all_pairs = [(a, b) for a in range(p) for b in range(p)]
-    n_train = int(len(all_pairs) * train_frac)
+    """Create train/test datasets with train_frac of all pairs for configured operations."""
+    assert len(config.operators) > 0, "Must specify at least one operator"
+
+    # Create all pairs for selected operations
+    all_examples = []
+    for a in range(p):
+        for b in range(p):
+            for op in config.operators:
+                all_examples.append((a, b, op))
+
+    n_train = int(len(all_examples) * train_frac)
 
     # Shuffle deterministically
     generator = t.Generator().manual_seed(42)
-    perm = t.randperm(len(all_pairs), generator=generator).tolist()
+    perm = t.randperm(len(all_examples), generator=generator).tolist()
 
-    train_pairs = [all_pairs[i] for i in perm[:n_train]]
-    test_pairs = [all_pairs[i] for i in perm[n_train:]]
+    train_data = [all_examples[i] for i in perm[:n_train]]
+    test_data = [all_examples[i] for i in perm[n_train:]]
 
-    return ModAdditionDataset(p, train_pairs), ModAdditionDataset(p, test_pairs)
+    return ModArithmeticDataset(p, train_data), ModArithmeticDataset(p, test_data)
 
 
 # %%
@@ -207,7 +238,7 @@ def train():
         model.parameters(),
         lr=config.lr,
         weight_decay=config.weight_decay,
-        betas=(0.9, 0.98),
+        betas=config.betas,
     )
 
     converged_at = None

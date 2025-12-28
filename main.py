@@ -29,7 +29,7 @@ class Config:
     epochs: int = 50000
     log_every: int = 100
     seed: int = 42
-    dtype: str = "float32"
+    dtype: t.dtype = t.float32
     device: str = (
         "mps"
         if t.backends.mps.is_available()
@@ -179,7 +179,7 @@ def train():
 
     wandb.init(
         project="ben-interp",
-        name=f"mod{config.p}-add-L{config.n_layers}-wd{config.weight_decay}-gc{config.grad_clip}",
+        name=f"mod{config.p}-add-L{config.n_layers}-wd{config.weight_decay}-gc{config.grad_clip} ({config.device}, {config.dtype})",
         config=config.__dict__,
     )
 

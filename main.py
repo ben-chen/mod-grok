@@ -32,8 +32,9 @@ class Config:
 
     @property
     def run_name(self) -> str:
-        ops = "".join(self.operators)
-        return f"mod{self.p}-{ops}-L{self.n_layers}-wd{self.weight_decay}-gc{self.grad_clip}"
+        ops = ",".join(self.operators)
+        pos_name = ["pre", "in", "post"][self.op_pos]
+        return f"mod{self.p}-{ops}-{pos_name}-L{self.n_layers}-wd{self.weight_decay}-gc{self.grad_clip}"
 
     train_frac: float = 0.3  # 30% train, 70% test
     lr: float = 1e-3

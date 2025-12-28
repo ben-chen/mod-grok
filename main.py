@@ -1,5 +1,6 @@
 # %%
 import math
+import os
 from dataclasses import dataclass
 
 import torch as t
@@ -26,8 +27,13 @@ class Config:
 
     @property
     def vocab_size(self) -> int:
-        # p for numbers, 3 for '=' '+', and '*'
-        return self.p + 3
+        # p for numbers, 5 for '=', '+', '*', '-', '/'
+        return self.p + 5
+
+    @property
+    def run_name(self) -> str:
+        ops = "".join(self.operators)
+        return f"mod{self.p}-{ops}-L{self.n_layers}-wd{self.weight_decay}-gc{self.grad_clip}"
 
     train_frac: float = 0.3  # 30% train, 70% test
     lr: float = 1e-3
@@ -36,6 +42,8 @@ class Config:
     grad_clip: float = 1.0
     epochs: int = 500_000
     log_every: int = 100
+    save_every: int = 1000
+    checkpoint_dir: str = "checkpoints"
     seed: int = 42
     dtype: t.dtype = t.float32
     device: str = (
@@ -58,6 +66,15 @@ config = Config()
 EQUALS_TOKEN = config.p  # 113
 PLUS_TOKEN = config.p + 1  # 114
 MULT_TOKEN = config.p + 2  # 115
+MINUS_TOKEN = config.p + 3  # 116
+DIV_TOKEN = config.p + 4  # 117
+
+OP_TOKENS = {
+    "+": PLUS_TOKEN,
+    "*": MULT_TOKEN,
+    "-": MINUS_TOKEN,
+    "/": DIV_TOKEN,
+}
 
 
 # %%
@@ -72,12 +89,24 @@ class ModArithmeticDataset(Dataset):
 
     def __getitem__(self, idx):
         a, b, op = self.data[idx]
+
         if op == "+":
             c = (a + b) % self.p
-            op_token = PLUS_TOKEN
-        else:  # op == '*'
+        elif op == "*":
             c = (a * b) % self.p
-            op_token = MULT_TOKEN
+        elif op == "-":
+            c = (a - b) % self.p
+        elif op == "/":
+            # b != 0 is guaranteed by create_datasets
+            # modular division: a / b = a * b^(-1) mod p
+            assert b != 0, (
+                "Division by zero, the dataset should not contain such examples"
+            )
+            c = (a * pow(b, self.p - 2, self.p)) % self.p
+        else:
+            raise ValueError(f"Unknown operator: {op}")
+
+        op_token = OP_TOKENS[op]
 
         # Build sequence based on operator position
         if config.op_pos == 0:  # prefix: op a b =
@@ -101,6 +130,9 @@ def create_datasets(p: int, train_frac: float):
     for a in range(p):
         for b in range(p):
             for op in config.operators:
+                # Skip b=0 for division (undefined)
+                if op == "/" and b == 0:
+                    continue
                 all_examples.append((a, b, op))
 
     n_train = int(len(all_examples) * train_frac)
@@ -202,6 +234,32 @@ class Transformer(nn.Module):
         logits = self.unembed(x[:, -1])  # only predict from last position
         return logits
 
+    @classmethod
+    def load(cls, checkpoint_path: str, device: str | None = None):
+        """Load a model from a checkpoint file. Returns (model, config)."""
+        checkpoint = t.load(checkpoint_path, map_location=device or config.device)
+
+        # Print checkpoint info
+        print(f"Loading checkpoint: {checkpoint_path}")
+        print(f"  Epoch: {checkpoint['epoch']}")
+        print(
+            f"  Train loss: {checkpoint['train_loss']:.4f}, Train acc: {checkpoint['train_acc']:.4f}"
+        )
+        print(
+            f"  Test loss: {checkpoint['test_loss']:.4f}, Test acc: {checkpoint['test_acc']:.4f}"
+        )
+
+        # Reconstruct config from checkpoint
+        loaded_config = Config(**checkpoint["config"])
+        print(f"  Run name: {loaded_config.run_name}")
+
+        # Create model and load weights
+        model = cls(loaded_config)
+        model.load_state_dict(checkpoint["model_state_dict"])
+        model.to(device or loaded_config.device)
+
+        return model, loaded_config
+
 
 # %%
 # Training - full batch, constant LR (matching Nanda's setup)
@@ -210,7 +268,7 @@ def train():
 
     wandb.init(
         project="ben-interp",
-        name=f"mod{config.p}-add-L{config.n_layers}-wd{config.weight_decay}-gc{config.grad_clip} ({config.device}, {config.dtype})",
+        name=config.run_name,
         config=config.__dict__,
     )
 
@@ -240,6 +298,9 @@ def train():
         weight_decay=config.weight_decay,
         betas=config.betas,
     )
+
+    # Create checkpoint directory
+    os.makedirs(os.path.join(config.checkpoint_dir, config.run_name), exist_ok=True)
 
     converged_at = None
     for epoch in range(config.epochs):
@@ -283,6 +344,23 @@ def train():
                 "train/grad_norm": grad_norm,
             }
         )
+
+        # Save checkpoint
+        if epoch % config.save_every == 0:
+            checkpoint = {
+                "epoch": epoch,
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "train_loss": loss.item(),
+                "test_loss": test_loss,
+                "train_acc": train_acc,
+                "test_acc": test_acc,
+                "config": config.__dict__,
+            }
+            checkpoint_path = os.path.join(
+                config.checkpoint_dir, config.run_name, f"epoch_{epoch:06d}.pt"
+            )
+            t.save(checkpoint, checkpoint_path)
 
         if test_acc == 1.0 and converged_at is None:
             print(

@@ -25,9 +25,11 @@ class Config:
     train_frac: float = 0.3  # 30% train, 70% test
     lr: float = 1e-3
     weight_decay: float = 1.0
+    grad_clip: float = 1.0
     epochs: int = 50000
     log_every: int = 100
     seed: int = 42
+    dtype: str = "float32"
     device: str = (
         "mps"
         if t.backends.mps.is_available()
@@ -177,7 +179,7 @@ def train():
 
     wandb.init(
         project="ben-interp",
-        name=f"mod{config.p}-add-L{config.n_layers}",
+        name=f"mod{config.p}-add-L{config.n_layers}-wd{config.weight_decay}-gc{config.grad_clip}",
         config=config.__dict__,
     )
 
@@ -208,6 +210,7 @@ def train():
         betas=(0.9, 0.98),
     )
 
+    converged_at = None
     for epoch in range(config.epochs):
         model.train()
 
@@ -217,14 +220,9 @@ def train():
         optimizer.zero_grad()
         loss.backward()
 
-        # Compute gradient norm before optimizer step
-        grad_norm = (
-            sum(
-                p.grad.norm().item() ** 2
-                for p in model.parameters()
-                if p.grad is not None
-            )
-            ** 0.5
+        # Compute gradient norm and clip
+        grad_norm = t.nn.utils.clip_grad_norm_(
+            model.parameters(), max_norm=config.grad_clip
         )
 
         optimizer.step()
@@ -238,7 +236,7 @@ def train():
             test_loss = F.cross_entropy(test_logits, test_y).item()
             test_acc = (test_logits.argmax(-1) == test_y).float().mean().item()
 
-        if epoch % config.log_every == 0 or test_acc == 1.0:
+        if epoch % config.log_every == 0 or (test_acc == 1.0 and converged_at is None):
             print(
                 f"Epoch {epoch}: train_loss={loss.item():.4f}, train_acc={train_acc:.4f}, "
                 f"test_loss={test_loss:.4f}, test_acc={test_acc:.4f}"
@@ -255,8 +253,14 @@ def train():
             }
         )
 
-        if test_acc == 1.0:
-            print(f"Perfect test accuracy reached at epoch {epoch}!")
+        if test_acc == 1.0 and converged_at is None:
+            print(
+                f"Perfect test accuracy reached at epoch {epoch}! Running for 5k more steps..."
+            )
+            converged_at = epoch
+
+        if converged_at is not None and epoch >= converged_at + 5000:
+            print("Finished 5k steps after convergence.")
             break
 
     wandb.finish()

@@ -202,7 +202,7 @@ def train():
         config.device
     )
 
-    model = Transformer(config).to(config.device)
+    model = Transformer(config).to(dtype=config.dtype, device=config.device)
     optimizer = t.optim.AdamW(
         model.parameters(),
         lr=config.lr,
